@@ -8,14 +8,17 @@ except ImportError:
     from playwright.sync_api import sync_playwright
 
 # --- 环境变量 (可在Settings里设置secrets或者私库直接填写在双引号里)---
-COOKIE_VALUE = os.environ.get('COOKIE_VALUE') or ""    # remember_web cookie 值，必填
-EMAIL        = os.environ.get('EMAIL') or ""           # 登录邮箱,可选，作为备用, 建议填写
-PASSWORD     = os.environ.get('PASSWORD') or ""        # 登录密码,可选，作为备用, 建议填写
-TG_CHAT_ID   = os.environ.get('TG_CHAT_ID') or ""      # Telegram Chat ID,可选，通知
-TG_BOT_TOKEN = os.environ.get('TG_BOT_TOKEN') or ""    # Telegram Bot Token,可选
+COOKIE_VALUE  = os.environ.get('COOKIE_VALUE') or ""   # remember_web cookie 值，可选
+DISCORD_TOKEN = (os.environ.get('DISCORD_TOKEN') or "").strip()  # Discord 用户 Token
+EMAIL         = os.environ.get('EMAIL') or ""          # 登录邮箱,可选，作为备用
+PASSWORD      = os.environ.get('PASSWORD') or ""       # 登录密码,可选，作为备用
+TG_CHAT_ID    = os.environ.get('TG_CHAT_ID') or ""     # Telegram Chat ID,可选，通知
+TG_BOT_TOKEN  = os.environ.get('TG_BOT_TOKEN') or ""   # Telegram Bot Token,可选
 
 BASE_URL = "https://dash.hidencloud.com"
 LOGIN_URL = f"{BASE_URL}/auth/login"
+DISCORD_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36")
 
 # --- 代理配置（由工作流 shell 脚本写入 $GITHUB_ENV）---
 IS_PROXY      = os.environ.get('IS_PROXY', 'false').lower() == 'true'
@@ -94,7 +97,7 @@ def send_telegram_notification(status, old_due, new_due):
         masked_EMAIL = EMAIL[:2] + '****'
 
     text = (
-        f"🇲🇽 HidenCloud 续期通知\n\n"
+        f"🇮🇳 HidenCloud 续期通知\n\n"
         f"{status}\n"
         f"👤 账号: {masked_EMAIL}\n"
         f"📅 续期前到期：{old_due}\n"
@@ -419,7 +422,105 @@ def solve_turnstile(page, timeout=120, success_check=None,
         pass
     return False
 
+def discord_oauth_login():
+    """用 Discord Token 完成 HidenCloud OAuth，返回已登录的 requests.Session"""
+    if not DISCORD_TOKEN:
+        return None
+
+    s = requests.Session()
+    if REQUESTS_PROXIES:
+        s.proxies.update(REQUESTS_PROXIES)
+    s.headers.update({
+        'User-Agent': DISCORD_UA,
+        'Accept': 'application/json, text/plain, */*',
+        'Accept-Language': 'en-US,en;q=0.9',
+    })
+
+    try:
+        # 1) 让 HidenCloud 生成带 state 的 Discord 授权地址，同时拿到会话 cookie
+        r = s.get(f"{BASE_URL}/oauth/discord/login", allow_redirects=False, timeout=30)
+        oauth_url = r.headers.get('location') or ''
+        if 'discord.com' not in oauth_url:
+            log(f"❌ Discord OAuth 初始化失败: HTTP {r.status_code}")
+            return None
+        log("🎮 已获取 HidenCloud Discord 授权地址")
+
+        # 2) 用 Discord Token 自动同意授权
+        r2 = s.post(
+            oauth_url,
+            headers={
+                'Authorization': DISCORD_TOKEN,
+                'Content-Type': 'application/json',
+                'Origin': 'https://discord.com',
+                'Referer': 'https://discord.com/',
+            },
+            json={'authorize': True},
+            timeout=30,
+        )
+        try:
+            data = r2.json()
+        except Exception:
+            data = {}
+        callback = data.get('location') or ''
+        if 'code=' not in callback:
+            log(f"❌ Discord 授权失败: HTTP {r2.status_code} {str(data)[:200]}")
+            return None
+        log("🎮 Discord 授权成功，正在回跳 HidenCloud...")
+
+        # 3) 回跳 HidenCloud 完成登录
+        r3 = s.get(callback, allow_redirects=True, timeout=30)
+        if 'auth/login' in (r3.url or ''):
+            log(f"❌ Discord 回跳后仍未登录: {r3.url}")
+            return None
+
+        names = [c.name for c in s.cookies
+                 if 'hidencloud' in (c.domain or '') or not c.domain]
+        log(f"🎮 Discord 登录成功，cookies: {names}")
+        return s
+    except Exception as e:
+        log(f"❌ Discord Token 登录异常: {e}")
+        return None
+
+
 def login(page):
+    # 0. Discord Token 登录（免费服务续期必须走 Discord）
+    if DISCORD_TOKEN:
+        log("🎮 尝试 Discord Token 登录...")
+        sess = discord_oauth_login()
+        if sess is not None:
+            cookies = []
+            for c in sess.cookies:
+                domain = c.domain or 'dash.hidencloud.com'
+                if 'hidencloud' not in domain:
+                    continue
+                cookies.append({
+                    'name': c.name,
+                    'value': c.value,
+                    'domain': domain,
+                    'path': c.path or '/',
+                    'secure': True,
+                    'sameSite': 'Lax',
+                })
+            if cookies:
+                try:
+                    page.context.add_cookies(cookies)
+                    log(f"🍪 已写入 {len(cookies)} 个 Discord 登录 Cookie")
+                except Exception as e:
+                    log(f"⚠️ 写入 Discord 登录 Cookie 失败: {e}")
+                try:
+                    page.goto(f"{BASE_URL}/dashboard", wait_until="domcontentloaded", timeout=60000)
+                    solve_turnstile(page, timeout=120, success_check=page_ready, reload_after=8)
+                    page_title = page.title()
+                    log(f"📝 当前Title: {page_title}")
+                    if "auth/login" not in page.url:
+                        log("✅ Discord Token 登录成功！当前已到达dashboard页面")
+                        return True
+                    log("⚠️ Discord 登录会话无效，切换到其他登录方式...")
+                except Exception as e:
+                    log(f"⚠️ Discord 登录后访问失败: {e}")
+        else:
+            log("⚠️ Discord Token 登录失败，切换到其他登录方式...")
+
     # 1. Cookie 登录尝试
     if COOKIE_VALUE:
         log("📇 尝试 Cookie 登录...")
@@ -697,9 +798,10 @@ def renew_service(page):
 
 def main():
     # 检查必要环境变量
-    log(f"🔍 凭证检测: COOKIE_VALUE={'已配置' if COOKIE_VALUE else '未配置'}, "
+    log(f"🔍 凭证检测: DISCORD_TOKEN={'已配置' if DISCORD_TOKEN else '未配置'}, "
+        f"COOKIE_VALUE={'已配置' if COOKIE_VALUE else '未配置'}, "
         f"EMAIL={'已配置' if EMAIL else '未配置'}, PASSWORD={'已配置' if PASSWORD else '未配置'}")
-    if not COOKIE_VALUE and not (EMAIL and PASSWORD):
+    if not DISCORD_TOKEN and not COOKIE_VALUE and not (EMAIL and PASSWORD):
         log("❌ 缺少登录凭证")
         sys.exit(1)
 
